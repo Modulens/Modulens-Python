@@ -1,0 +1,29 @@
+{
+  "called_functions": {
+    "app_logic.helpers.greet_user": {
+      "count": 24,
+      "total_time_sec": 0.0006000000000000001,
+      "avg_time_ms": 0.03
+    },
+    "app_logic.helpers.do_stuff": {
+      "count": 24,
+      "total_time_sec": 0.0,
+      "avg_time_ms": 0.0
+    },
+    "app_logic.helpers.farewell": {
+      "count": 24,
+      "total_time_sec": 0.0,
+      "avg_time_ms": 0.0
+    }
+  },
+  "dead_functions": [
+    "app_logic.helpers.dead"
+  ],
+  "duration_sec": 464.8,
+  "defined_functions": [
+    "app_logic.helpers.dead",
+    "app_logic.helpers.do_stuff",
+    "app_logic.helpers.farewell",
+    "app_logic.helpers.greet_user"
+  ]
+}
