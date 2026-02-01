@@ -96,11 +96,36 @@ class ModulensProfiler:
         self._flush_thread = threading.Thread(target=loop, daemon=True)
         self._flush_thread.start()
 
+    def _remove_profiler(self):
+        """Stop profiling: clear sys and threading profilers."""
+        sys.setprofile(None)
+        threading.setprofile(None)
+
     def _shutdown(self):
+        """Atexit handler: stop flush loop and do final flush."""
         self._stop_event.set()
         if self._flush_thread:
             self._flush_thread.join(timeout=2)
         self.flush(report=True)
+        self._remove_profiler()
+
+    def stop(self, report=True):
+        """
+        Stop profiling: final flush, stop flush loop, remove profiler, unregister atexit.
+        Safe to call multiple times; no-op if not started.
+        """
+        if not self._initialized:
+            return
+        try:
+            atexit.unregister(self._shutdown)
+        except Exception:
+            pass
+        self._stop_event.set()
+        if self._flush_thread:
+            self._flush_thread.join(timeout=2)
+        self.flush(report=report)
+        self._remove_profiler()
+        self._initialized = False
 
     def _get_defined_functions(self):
         funcs = set()
@@ -114,6 +139,12 @@ class ModulensProfiler:
                     funcs.add(f"{modname}.{name}")
             except: pass
         return funcs
+
+    def _reset_after_flush(self):
+        """Reset counts and start time so next flush is for a new interval (not cumulative)."""
+        self.call_counts.clear()
+        self.call_durations.clear()
+        self.start_time = time.time()
 
     def flush(self, report=True):
         duration = time.time() - self.start_time
@@ -135,7 +166,9 @@ class ModulensProfiler:
                 "total_time_sec": round(tot, 4),
                 "avg_time_ms": round(avg_ms, 2)
             }
-        flush_data(out, report=report)
+        ok = flush_data(out, report=report)
+        if ok:
+            self._reset_after_flush()
 
     def start(self, include=None, exclude=None, sample_rate=1.0):
         if self._initialized:
@@ -164,5 +197,5 @@ class ModulensProfiler:
 # Singleton + API exports
 default_profiler = ModulensProfiler()
 start = default_profiler.start
-stop = default_profiler.flush
+stop = default_profiler.stop
 flush = default_profiler.flush
