@@ -61,8 +61,6 @@ def _send_ingest(payload: dict, report: bool) -> bool:
     except (TypeError, ValueError):
         org_id = 0
     if not api_url or not api_key or not project_id or org_id <= 0:
-        if report:
-            print("[Modulens] ⏭️  Skipping HTTP ingest (set MODULENS_API_URL, MODULENS_API_KEY, MODULENS_PROJECT_ID, MODULENS_ORG_ID for E2E)")
         return True  # not a failure, just skipped
 
     url = f"{api_url.rstrip('/')}{INGEST_ENDPOINT}"
@@ -82,8 +80,6 @@ def _send_ingest(payload: dict, report: bool) -> bool:
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 if 200 <= resp.status < 300:
-                    if report:
-                        print("[Modulens] ✅ Ingest sent to Modulens")
                     return True
                 last_error = f"HTTP {resp.status}"
         except urllib.error.HTTPError as e:
@@ -97,8 +93,6 @@ def _send_ingest(payload: dict, report: bool) -> bool:
         if attempt < MAX_HTTP_RETRIES:
             time.sleep(HTTP_RETRY_DELAY_SEC * (attempt + 1))
 
-    if report:
-        print(f"[Modulens] ❌ Ingest failed: {last_error}")
     return False
 
 
@@ -128,13 +122,7 @@ def flush_data(payload: dict, report: bool = True) -> bool:
         try:
             with open(DEFAULT_OUTPUT_PATH, "w") as f:
                 json.dump(report_array, f, indent=2)
-            if report:
-                print(f"[Modulens] ✅ Appended new flush to {DEFAULT_OUTPUT_PATH}")
-                print(f"[Modulens] 🔍 {len(new_report['called_functions'])} used functions")
-                print(f"[Modulens] ⚰️  {len(new_report['dead_functions'])} dead functions")
-        except Exception as e:
-            if report:
-                print(f"[Modulens] ❌ Failed to write report: {e}")
+        except Exception:
             file_ok = False
 
     if output in ("http", "both"):

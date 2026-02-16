@@ -91,8 +91,8 @@ class ModulensProfiler:
             while not self._stop_event.wait(self.flush_interval):
                 try:
                     self.flush(report=False)
-                except Exception as e:
-                    print(f"[Modulens] Auto-flush error: {e}")
+                except Exception:
+                    pass
         self._flush_thread = threading.Thread(target=loop, daemon=True)
         self._flush_thread.start()
 
@@ -172,15 +172,7 @@ class ModulensProfiler:
 
     def start(self, include=None, exclude=None, sample_rate=1.0):
         if self._initialized:
-            print("[Modulens] ⚠️ Profiler already started")
             return
-
-        if include is None:
-            print(
-                "[Modulens] ⚠️ WARNING: No 'include' filter provided.\n"
-                "         You may accidentally track stdlib or third-party packages.\n"
-                "         Pass include=['your_project'] to avoid noisy data.\n"
-            )
 
         self.sample_rate = sample_rate
         if include:
