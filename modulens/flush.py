@@ -7,6 +7,8 @@ import urllib.error
 from .config import config
 
 DEFAULT_OUTPUT_PATH = "modulens_output/runtime_report.json"
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_FILE_REPORTS = 500
 INGEST_ENDPOINT = "/ingest"
 MAX_HTTP_RETRIES = 2
 HTTP_RETRY_DELAY_SEC = 1.0
@@ -23,9 +25,11 @@ def _build_report(payload: dict) -> dict:
         count = stats.get("count", 0)
         total_time = stats.get("total_time_sec", 0.0)
         avg_time = round(1000.0 * total_time / count, 2) if count else 0.0
-        new_report["called_functions"][func] = {
+        error_counts = payload.get("error_counts", {})
+    new_report["called_functions"][func] = {
             "count": count,
             "avg_time_ms": avg_time,
+            "error_count": error_counts.get(func, 0),
         }
     return new_report
 
@@ -110,10 +114,16 @@ def flush_data(payload: dict, report: bool = True) -> bool:
         os.makedirs(os.path.dirname(DEFAULT_OUTPUT_PATH), exist_ok=True)
         if os.path.exists(DEFAULT_OUTPUT_PATH):
             try:
-                with open(DEFAULT_OUTPUT_PATH, "r") as f:
-                    report_array = json.load(f)
-                    if not isinstance(report_array, list):
-                        report_array = []
+                file_size = os.path.getsize(DEFAULT_OUTPUT_PATH)
+                if file_size > MAX_FILE_SIZE_BYTES:
+                    report_array = []
+                else:
+                    with open(DEFAULT_OUTPUT_PATH, "r") as f:
+                        report_array = json.load(f)
+                        if not isinstance(report_array, list):
+                            report_array = []
+                    if len(report_array) > MAX_FILE_REPORTS:
+                        report_array = report_array[-MAX_FILE_REPORTS // 2:]
             except Exception:
                 report_array = []
         else:
@@ -129,4 +139,8 @@ def flush_data(payload: dict, report: bool = True) -> bool:
         ingest_payload = _build_ingest_payload(new_report)
         http_ok = _send_ingest(ingest_payload, report=report)
 
+    if output == "file":
+        return file_ok
+    if output == "http":
+        return http_ok
     return file_ok and http_ok

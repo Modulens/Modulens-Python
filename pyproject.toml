@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modulens"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lightweight profiler for Python: track function calls, runtimes, and dead code with minimal overhead."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -28,4 +28,4 @@ Repository = "https://github.com/modulens/Modulens-Python"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["modulens*"]
+include = ["modulens"]
