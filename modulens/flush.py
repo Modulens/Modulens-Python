@@ -35,21 +35,11 @@ def _build_report(payload: dict) -> dict:
 
 
 def _build_ingest_payload(report: dict) -> dict:
-    """Build backend SnapshotInput payload (project_id, org_id, environment, etc.)."""
-    try:
-        org_id = config.get("org_id")
-        if isinstance(org_id, str) and org_id.isdigit():
-            org_id = int(org_id)
-        elif not isinstance(org_id, int):
-            org_id = 0
-    except Exception:
-        org_id = 0
-
+    """Build backend SnapshotInput payload (project_id, environment, etc.)."""
     return {
         "timestamp": report["timestamp"],
         "environment": config.get("environment", "production"),
         "project_id": config.get("project_id", ""),
-        "org_id": org_id,
         "called_functions": report["called_functions"],
         "dead_functions": report["dead_functions"],
     }
@@ -60,11 +50,7 @@ def _send_ingest(payload: dict, report: bool) -> bool:
     api_url = (config.get("api_url") or "").strip()
     api_key = (config.get("api_key") or "").strip()
     project_id = (config.get("project_id") or "").strip()
-    try:
-        org_id = int(payload.get("org_id", 0) or 0)
-    except (TypeError, ValueError):
-        org_id = 0
-    if not api_url or not api_key or not project_id or org_id <= 0:
+    if not api_url or not api_key or not project_id:
         return True  # not a failure, just skipped
 
     url = f"{api_url.rstrip('/')}{INGEST_ENDPOINT}"

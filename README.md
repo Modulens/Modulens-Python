@@ -73,22 +73,20 @@ modulens.start(include=['myproject', 'myapp'])
 
 ## Send Data to the Dashboard
 
-Set these environment variables and Modulens will stream function metrics to your dashboard automatically:
+Modulens defaults to sending data over HTTP to `https://modulens-backend.onrender.com`. Set your API key and project ID (from the dashboard) and you're done:
 
 ```bash
-MODULENS_API_URL=https://your-backend.example.com
 MODULENS_API_KEY=ml_xxxx
 MODULENS_PROJECT_ID=your-project-slug
-MODULENS_ORG_ID=1
-MODULENS_OUTPUT=http
-MODULENS_ENVIRONMENT=production
 ```
+
+Optional: `MODULENS_API_URL` (default: `https://modulens-backend.onrender.com`), `MODULENS_OUTPUT` (default: `http`), `MODULENS_ENVIRONMENT` (default: `production`).
 
 Then visit [dashboard.modulens.io](https://dashboard.modulens.io) to see live function metrics, dead code, error counts, and dependency graphs.
 
 ## Local-Only Mode
 
-Don't set any API variables and Modulens writes to a local JSON file instead:
+Set `MODULENS_OUTPUT=file` (and don't set `MODULENS_API_KEY` / `MODULENS_PROJECT_ID`) and Modulens writes to a local JSON file instead:
 
 ```
 modulens_output/runtime_report.json
@@ -100,12 +98,11 @@ Use `MODULENS_OUTPUT=both` to write locally and send to the API at the same time
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MODULENS_FLUSH_INTERVAL` | Seconds between auto-flushes | `30` |
-| `MODULENS_OUTPUT` | `file`, `http`, or `both` | `file` |
-| `MODULENS_API_URL` | Backend ingest URL | — |
+| `MODULENS_FLUSH_INTERVAL` | Seconds between auto-flushes | `60` |
+| `MODULENS_OUTPUT` | `file`, `http`, or `both` | `http` |
+| `MODULENS_API_URL` | Backend ingest URL | `https://modulens-backend.onrender.com` |
 | `MODULENS_API_KEY` | Project API key | — |
 | `MODULENS_PROJECT_ID` | Project slug from dashboard | — |
-| `MODULENS_ORG_ID` | Organization ID | — |
 | `MODULENS_ENVIRONMENT` | e.g. `production`, `staging` | `production` |
 
 ### Programmatic Options
