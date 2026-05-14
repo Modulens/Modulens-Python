@@ -1,12 +1,17 @@
-import sys
-import threading
-import time
+"""Modulens profiler: interpreter-level call profiling with periodic flush."""
+from __future__ import annotations
+
 import atexit
 import inspect
-import site
-import sysconfig
 import random
+import site
+import sys
+import sysconfig
+import threading
+import time
 from collections import defaultdict
+from typing import Any, Dict, Iterable, Optional, Set, Tuple
+
 from .config import config
 from .constants import (
     AVG_TIME_MS_DECIMALS,
@@ -24,133 +29,173 @@ from .feature_flags import default_recorder
 from .flush import flush_data
 
 STDLIB_PATH = sysconfig.get_paths().get("stdlib", "")
-SITE_PACKAGES = set(site.getsitepackages())
+SITE_PACKAGES: Set[str] = set(site.getsitepackages())
 VENV_PREFIXES = [p for p in sys.path if "site-packages" in p or "venv" in p or "env" in p]
 
+_THIRDPARTY_SUBSTRINGS = ("site-packages", "dist-packages", "/lib/python", "\\lib\\python")
+
+_warned_once = False
+_warn_lock = threading.Lock()
+
+
+def _warn_once(msg: str) -> None:
+    global _warned_once
+    with _warn_lock:
+        if _warned_once:
+            return
+        _warned_once = True
+    sys.stderr.write(f"[modulens] profile handler error: {msg}\n")
+
+
 class ModulensProfiler:
-    def __init__(self):
+    def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.call_counts = defaultdict(int)
-        self.call_durations = defaultdict(float)
-        self.error_counts = defaultdict(int)
+        self.call_counts: Dict[str, int] = defaultdict(int)
+        self.call_durations: Dict[str, float] = defaultdict(float)
+        self.error_counts: Dict[str, int] = defaultdict(int)
         self.start_time = time.time()
-        self.included = set()
-        self.excluded = set(config.get("exclude", []))
-        self.observed_modules = set()
+        self.included: Set[str] = set()
+        self.excluded: Set[str] = set(config.get("exclude", []))
+        self.observed_modules: Set[str] = set()
         self.sample_rate = DEFAULT_SAMPLE_RATE
         self.flush_interval = config.get("flush_interval", DEFAULT_FLUSH_INTERVAL_SEC)
-        self._flush_thread = None
+        self._flush_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._initialized = False
-        self._track_cache = {}
-        self._call_starts = {}
-        self._included_tuple = ()
-        self._excluded_tuple = tuple(self.excluded)
+        self._track_cache: Dict[str, bool] = {}
+        # Hot-path caches keyed by `id(code)` (stable for the process):
+        self._code_track_cache: Dict[int, bool] = {}
+        self._code_key_cache: Dict[int, str] = {}
+        self._call_starts: Dict[int, float] = {}
+        self._included_tuple: Tuple[str, ...] = ()
+        self._excluded_tuple: Tuple[str, ...] = tuple(self.excluded)
 
-    def _is_third_party_or_stdlib(self, filename):
+    def _is_third_party_or_stdlib(self, filename: str) -> bool:
         if not filename:
             return True
-        return (
-            filename.startswith(STDLIB_PATH)
-            or "site-packages" in filename
-            or "dist-packages" in filename
-            or "/lib/python" in filename
-            or "\\lib\\python" in filename
-            or filename.startswith(sys.prefix)  # covers venv base path
-        )
+        if STDLIB_PATH and filename.startswith(STDLIB_PATH):
+            return True
+        for needle in _THIRDPARTY_SUBSTRINGS:
+            if needle in filename:
+                return True
+        return filename.startswith(sys.prefix)
 
-    def _should_track(self, frame):
-        mod = frame.f_globals.get("__name__")
-        if not mod:
+    def _should_track_module(self, modname: str, filename: str) -> bool:
+        if not modname:
             return False
-
-        cached = self._track_cache.get(mod)
+        cached = self._track_cache.get(modname)
         if cached is not None:
             return cached
-
-        fn = frame.f_code.co_filename
-        if not fn:
-            self._track_cache[mod] = False
+        if not filename:
+            self._track_cache[modname] = False
             return False
-
         if self._included_tuple:
-            if not any(mod.startswith(p) for p in self._included_tuple):
-                self._track_cache[mod] = False
+            if not any(modname.startswith(p) for p in self._included_tuple):
+                self._track_cache[modname] = False
                 return False
-        if any(mod.startswith(p) for p in self._excluded_tuple):
-            self._track_cache[mod] = False
+        if any(modname.startswith(p) for p in self._excluded_tuple):
+            self._track_cache[modname] = False
             return False
-
-        if self._is_third_party_or_stdlib(fn):
-            self._track_cache[mod] = False
+        if self._is_third_party_or_stdlib(filename):
+            self._track_cache[modname] = False
             return False
-
-        self.observed_modules.add(mod)
-        self._track_cache[mod] = True
+        self.observed_modules.add(modname)
+        self._track_cache[modname] = True
         return True
 
-    def _func_key(self, frame):
-        return f"{frame.f_globals.get('__name__', '__main__')}.{frame.f_code.co_name}"
+    def _resolve_code(self, frame: Any) -> Optional[str]:
+        """Return the cached func_key for this code object, or None if untracked."""
+        code = frame.f_code
+        cid = id(code)
+        cached_key = self._code_key_cache.get(cid)
+        if cached_key is not None:
+            return cached_key
+        tracked = self._code_track_cache.get(cid)
+        if tracked is False:
+            return None
 
-    def _profile_handler(self, frame, event, arg):
+        modname = frame.f_globals.get("__name__", "__main__")
+        if not self._should_track_module(modname, code.co_filename):
+            self._code_track_cache[cid] = False
+            return None
+
+        key = f"{modname}.{code.co_name}"
+        self._code_key_cache[cid] = key
+        self._code_track_cache[cid] = True
+        return key
+
+    def _profile_handler(self, frame: Any, event: str, arg: Any) -> None:
         try:
             if event == "call":
-                if not self._should_track(frame):
+                key = self._resolve_code(frame)
+                if key is None:
                     return
                 if self.sample_rate < DEFAULT_SAMPLE_RATE and random.random() > self.sample_rate:
                     return
-                key = self._func_key(frame)
+                fid = id(frame)
+                now = time.perf_counter()
                 with self._lock:
                     self.call_counts[key] += 1
-                    self._call_starts[id(frame)] = time.perf_counter()
+                    self._call_starts[fid] = now
                     if len(self._call_starts) > CALL_STARTS_MAX:
                         self._call_starts.clear()
 
             elif event == "return":
+                fid = id(frame)
                 with self._lock:
-                    start = self._call_starts.pop(id(frame), None)
-                if start is not None:
-                    key = self._func_key(frame)
-                    elapsed = time.perf_counter() - start
-                    with self._lock:
-                        self.call_durations[key] += elapsed
+                    start = self._call_starts.pop(fid, None)
+                if start is None:
+                    return
+                key = self._resolve_code(frame)
+                if key is None:
+                    return
+                elapsed = time.perf_counter() - start
+                with self._lock:
+                    self.call_durations[key] += elapsed
 
             elif event == "exception":
                 fid = id(frame)
                 with self._lock:
                     if fid not in self._call_starts:
                         return
-                if arg and len(arg) >= PROFILE_EXCEPTION_TUPLE_MIN_LEN and arg[PROFILE_EXCEPTION_TRACEBACK_INDEX] is not None:
+                if (
+                    arg
+                    and len(arg) >= PROFILE_EXCEPTION_TUPLE_MIN_LEN
+                    and arg[PROFILE_EXCEPTION_TRACEBACK_INDEX] is not None
+                ):
                     tb = arg[PROFILE_EXCEPTION_TRACEBACK_INDEX]
                     if tb.tb_next is not None:
                         return
-                key = self._func_key(frame)
+                key = self._resolve_code(frame)
+                if key is None:
+                    return
                 with self._lock:
                     self.error_counts[key] += 1
                     self._call_starts.pop(fid, None)
-        except Exception:
-            pass
+        except Exception as e:  # narrow + warn-once to avoid hiding bugs
+            _warn_once(repr(e))
 
-    def _apply_profiler(self):
+    def _apply_profiler(self) -> None:
         sys.setprofile(self._profile_handler)
         threading.setprofile(self._profile_handler)
 
-    def _start_flush_loop(self):
-        def loop():
+    def _start_flush_loop(self) -> None:
+        def loop() -> None:
             while not self._stop_event.wait(self.flush_interval):
                 try:
                     self.flush(report=False)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _warn_once(repr(e))
+
         self._flush_thread = threading.Thread(target=loop, daemon=True)
         self._flush_thread.start()
 
-    def _remove_profiler(self):
+    def _remove_profiler(self) -> None:
         """Stop profiling: clear sys and threading profilers."""
         sys.setprofile(None)
         threading.setprofile(None)
 
-    def _shutdown(self):
+    def _shutdown(self) -> None:
         """Atexit handler: stop flush loop and do final flush."""
         self._stop_event.set()
         if self._flush_thread:
@@ -158,11 +203,8 @@ class ModulensProfiler:
         self.flush(report=True)
         self._remove_profiler()
 
-    def stop(self, report=True):
-        """
-        Stop profiling: final flush, stop flush loop, remove profiler, unregister atexit.
-        Safe to call multiple times; no-op if not started.
-        """
+    def stop(self, report: bool = True) -> None:
+        """Stop profiling: final flush, stop flush loop, remove profiler, unregister atexit."""
         if not self._initialized:
             return
         try:
@@ -176,8 +218,8 @@ class ModulensProfiler:
         self._remove_profiler()
         self._initialized = False
 
-    def _get_defined_functions(self):
-        funcs = set()
+    def _get_defined_functions(self) -> Set[str]:
+        funcs: Set[str] = set()
         for modname in self.observed_modules:
             try:
                 mod = sys.modules.get(modname)
@@ -190,13 +232,20 @@ class ModulensProfiler:
                     if code is None:
                         continue
                     fn = code.co_filename
-                    if not fn or fn.startswith(STDLIB_PATH) or any(fn.startswith(p) for p in SITE_PACKAGES) or any(fn.startswith(p) for p in VENV_PREFIXES):
+                    if not fn:
+                        continue
+                    if (
+                        STDLIB_PATH and fn.startswith(STDLIB_PATH)
+                    ) or any(fn.startswith(p) for p in SITE_PACKAGES) or any(
+                        fn.startswith(p) for p in VENV_PREFIXES
+                    ):
                         continue
                     funcs.add(f"{modname}.{name}")
-            except: pass
+            except Exception as e:
+                _warn_once(repr(e))
         return funcs
 
-    def _reset_after_flush(self):
+    def _reset_after_flush(self) -> None:
         """Reset counts and start time so next flush is for a new interval (not cumulative)."""
         with self._lock:
             self.call_counts.clear()
@@ -206,7 +255,7 @@ class ModulensProfiler:
             default_recorder.clear()
             self.start_time = time.time()
 
-    def flush(self, report=True):
+    def flush(self, report: bool = True) -> None:
         with self._lock:
             duration = time.time() - self.start_time
             counts_snapshot = dict(self.call_counts)
@@ -217,11 +266,11 @@ class ModulensProfiler:
         all_funcs = self._get_defined_functions()
         unused = sorted(all_funcs - used)
 
-        out = {
+        out: Dict[str, Any] = {
             "duration_sec": round(duration, DURATION_SEC_DECIMALS),
             "called_functions": {},
             "dead_functions": unused,
-            "defined_functions": sorted(list(all_funcs)),
+            "defined_functions": sorted(all_funcs),
             "error_counts": errors_snapshot,
             "feature_flags": default_recorder.snapshot(),
         }
@@ -231,13 +280,18 @@ class ModulensProfiler:
             out["called_functions"][key] = {
                 "count": cnt,
                 "total_time_sec": round(tot, TOTAL_TIME_SEC_DECIMALS),
-                "avg_time_ms": round(avg_ms, AVG_TIME_MS_DECIMALS)
+                "avg_time_ms": round(avg_ms, AVG_TIME_MS_DECIMALS),
             }
         ok = flush_data(out, report=report)
         if ok:
             self._reset_after_flush()
 
-    def start(self, include=None, exclude=None, sample_rate=DEFAULT_SAMPLE_RATE):
+    def start(
+        self,
+        include: Optional[Iterable[str]] = None,
+        exclude: Optional[Iterable[str]] = None,
+        sample_rate: float = DEFAULT_SAMPLE_RATE,
+    ) -> None:
         if self._initialized:
             return
 
@@ -250,6 +304,8 @@ class ModulensProfiler:
             self.excluded.update(exclude)
             self._excluded_tuple = tuple(self.excluded)
         self._track_cache.clear()
+        self._code_track_cache.clear()
+        self._code_key_cache.clear()
 
         self._apply_profiler()
         atexit.register(self._shutdown)
@@ -257,7 +313,6 @@ class ModulensProfiler:
         self._initialized = True
 
 
-# Singleton + API exports
 default_profiler = ModulensProfiler()
 start = default_profiler.start
 stop = default_profiler.stop

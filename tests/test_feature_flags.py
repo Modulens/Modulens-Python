@@ -2,14 +2,13 @@ import asyncio
 import os
 import sys
 import unittest
-from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modulens import feature_flag
 from modulens.constants import OVERFLOW_VARIANT_KEY
-from modulens.feature_flags import default_recorder, serialize_variant
-from modulens.flush import _build_report
+from modulens.feature_flags import default_recorder, refresh_limits, serialize_variant
+from modulens.report import build_report
 
 
 class FeatureFlagTests(unittest.TestCase):
@@ -51,7 +50,7 @@ class FeatureFlagTests(unittest.TestCase):
             return False
 
         get_checkout_config()
-        report = _build_report(
+        report = build_report(
             {
                 "dead_functions": [],
                 "called_functions": {},
@@ -63,9 +62,15 @@ class FeatureFlagTests(unittest.TestCase):
         self.assertEqual(report["feature_flags"][0]["variants"]["false"], 1)
 
     def test_overflow_bucket_when_too_many_variants(self):
-        with patch("modulens.feature_flags._max_distinct_variants", return_value=4):
+        from modulens.feature_flags import _limits
+
+        original_cap = _limits.distinct_variants
+        _limits.distinct_variants = 4
+        try:
             for i in range(10):
                 default_recorder.record("many_return_buckets", "app.fn", f"bucket_{i}")
+        finally:
+            _limits.distinct_variants = original_cap
 
         rows = default_recorder.snapshot()
         self.assertEqual(len(rows), 1)
