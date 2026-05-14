@@ -8,13 +8,24 @@ import sysconfig
 import random
 from collections import defaultdict
 from .config import config
+from .constants import (
+    AVG_TIME_MS_DECIMALS,
+    CALL_STARTS_MAX,
+    DEFAULT_FLUSH_INTERVAL_SEC,
+    DEFAULT_SAMPLE_RATE,
+    DURATION_SEC_DECIMALS,
+    FLUSH_THREAD_JOIN_TIMEOUT_SEC,
+    MS_PER_SEC,
+    PROFILE_EXCEPTION_TRACEBACK_INDEX,
+    PROFILE_EXCEPTION_TUPLE_MIN_LEN,
+    TOTAL_TIME_SEC_DECIMALS,
+)
+from .feature_flags import default_recorder
 from .flush import flush_data
 
 STDLIB_PATH = sysconfig.get_paths().get("stdlib", "")
 SITE_PACKAGES = set(site.getsitepackages())
 VENV_PREFIXES = [p for p in sys.path if "site-packages" in p or "venv" in p or "env" in p]
-
-_CALL_STARTS_MAX = 10_000
 
 class ModulensProfiler:
     def __init__(self):
@@ -26,8 +37,8 @@ class ModulensProfiler:
         self.included = set()
         self.excluded = set(config.get("exclude", []))
         self.observed_modules = set()
-        self.sample_rate = 1.0
-        self.flush_interval = config.get("flush_interval", 60)
+        self.sample_rate = DEFAULT_SAMPLE_RATE
+        self.flush_interval = config.get("flush_interval", DEFAULT_FLUSH_INTERVAL_SEC)
         self._flush_thread = None
         self._stop_event = threading.Event()
         self._initialized = False
@@ -86,13 +97,13 @@ class ModulensProfiler:
             if event == "call":
                 if not self._should_track(frame):
                     return
-                if self.sample_rate < 1.0 and random.random() > self.sample_rate:
+                if self.sample_rate < DEFAULT_SAMPLE_RATE and random.random() > self.sample_rate:
                     return
                 key = self._func_key(frame)
                 with self._lock:
                     self.call_counts[key] += 1
                     self._call_starts[id(frame)] = time.perf_counter()
-                    if len(self._call_starts) > _CALL_STARTS_MAX:
+                    if len(self._call_starts) > CALL_STARTS_MAX:
                         self._call_starts.clear()
 
             elif event == "return":
@@ -109,8 +120,8 @@ class ModulensProfiler:
                 with self._lock:
                     if fid not in self._call_starts:
                         return
-                if arg and len(arg) >= 3 and arg[2] is not None:
-                    tb = arg[2]
+                if arg and len(arg) >= PROFILE_EXCEPTION_TUPLE_MIN_LEN and arg[PROFILE_EXCEPTION_TRACEBACK_INDEX] is not None:
+                    tb = arg[PROFILE_EXCEPTION_TRACEBACK_INDEX]
                     if tb.tb_next is not None:
                         return
                 key = self._func_key(frame)
@@ -143,7 +154,7 @@ class ModulensProfiler:
         """Atexit handler: stop flush loop and do final flush."""
         self._stop_event.set()
         if self._flush_thread:
-            self._flush_thread.join(timeout=2)
+            self._flush_thread.join(timeout=FLUSH_THREAD_JOIN_TIMEOUT_SEC)
         self.flush(report=True)
         self._remove_profiler()
 
@@ -160,7 +171,7 @@ class ModulensProfiler:
             pass
         self._stop_event.set()
         if self._flush_thread:
-            self._flush_thread.join(timeout=2)
+            self._flush_thread.join(timeout=FLUSH_THREAD_JOIN_TIMEOUT_SEC)
         self.flush(report=report)
         self._remove_profiler()
         self._initialized = False
@@ -170,8 +181,15 @@ class ModulensProfiler:
         for modname in self.observed_modules:
             try:
                 mod = sys.modules.get(modname)
+                if mod is None:
+                    continue
                 for name, obj in inspect.getmembers(mod, inspect.isfunction):
-                    fn = getattr(obj, "__code__", None).co_filename
+                    if getattr(obj, "__module__", None) != modname:
+                        continue
+                    code = getattr(obj, "__code__", None)
+                    if code is None:
+                        continue
+                    fn = code.co_filename
                     if not fn or fn.startswith(STDLIB_PATH) or any(fn.startswith(p) for p in SITE_PACKAGES) or any(fn.startswith(p) for p in VENV_PREFIXES):
                         continue
                     funcs.add(f"{modname}.{name}")
@@ -185,6 +203,7 @@ class ModulensProfiler:
             self.call_durations.clear()
             self.error_counts.clear()
             self._call_starts.clear()
+            default_recorder.clear()
             self.start_time = time.time()
 
     def flush(self, report=True):
@@ -199,29 +218,31 @@ class ModulensProfiler:
         unused = sorted(all_funcs - used)
 
         out = {
-            "duration_sec": round(duration, 2),
+            "duration_sec": round(duration, DURATION_SEC_DECIMALS),
             "called_functions": {},
             "dead_functions": unused,
             "defined_functions": sorted(list(all_funcs)),
             "error_counts": errors_snapshot,
+            "feature_flags": default_recorder.snapshot(),
         }
         for key, cnt in counts_snapshot.items():
             tot = durations_snapshot.get(key, 0.0)
-            avg_ms = (tot / cnt * 1000.0) if cnt else 0.0
+            avg_ms = (tot / cnt * MS_PER_SEC) if cnt else 0.0
             out["called_functions"][key] = {
                 "count": cnt,
-                "total_time_sec": round(tot, 4),
-                "avg_time_ms": round(avg_ms, 2)
+                "total_time_sec": round(tot, TOTAL_TIME_SEC_DECIMALS),
+                "avg_time_ms": round(avg_ms, AVG_TIME_MS_DECIMALS)
             }
         ok = flush_data(out, report=report)
         if ok:
             self._reset_after_flush()
 
-    def start(self, include=None, exclude=None, sample_rate=1.0):
+    def start(self, include=None, exclude=None, sample_rate=DEFAULT_SAMPLE_RATE):
         if self._initialized:
             return
 
         self.sample_rate = sample_rate
+        self.flush_interval = config.get("flush_interval", self.flush_interval)
         if include:
             self.included = set(include)
             self._included_tuple = tuple(self.included)

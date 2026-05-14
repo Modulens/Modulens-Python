@@ -104,6 +104,8 @@ Use `MODULENS_OUTPUT=both` to write locally and send to the API at the same time
 | `MODULENS_API_KEY` | Project API key | — |
 | `MODULENS_PROJECT_ID` | Project slug from dashboard | — |
 | `MODULENS_ENVIRONMENT` | e.g. `production`, `staging` | `production` |
+| `MODULENS_FEATURE_FLAG_MAX_VARIANT_LEN` | Max characters per serialized variant bucket | `128` |
+| `MODULENS_FEATURE_FLAG_MAX_DISTINCT_VARIANTS` | Max distinct buckets per flag/function per flush window | `64` |
 
 ### Programmatic Options
 
@@ -122,6 +124,21 @@ modulens.start(
 | `modulens.start(include, exclude, sample_rate)` | Start profiling. Registers exit hook and background flush. |
 | `modulens.flush(report=True)` | Flush current metrics now. Resets counters for the next interval. |
 | `modulens.stop(report=True)` | Stop profiling, final flush, clean up. Safe to call multiple times. |
+| `modulens.feature_flag(name=None)` | Decorate a function to record successful return values as feature-flag variants. |
+
+### Feature flags
+
+Wrap functions that return flag outcomes (booleans, strings, enums, small JSON-serializable values). Each successful return is serialized into a bucket and counted until the next flush. **Exceptions are not counted.**
+
+```python
+import modulens
+
+@modulens.feature_flag("new_checkout_ui")
+def get_checkout_config():
+    return True
+```
+
+Omit the name to use the function name as the flag key. Variants are capped for payload size (`MODULENS_FEATURE_FLAG_MAX_VARIANT_LEN`, `MODULENS_FEATURE_FLAG_MAX_DISTINCT_VARIANTS`). Flushes include a `feature_flags` array on local reports and on ingest when present.
 
 ## How It Works
 

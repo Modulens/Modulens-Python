@@ -5,13 +5,24 @@ import urllib.request
 import urllib.error
 
 from .config import config
-
-DEFAULT_OUTPUT_PATH = "modulens_output/runtime_report.json"
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
-MAX_FILE_REPORTS = 500
-INGEST_ENDPOINT = "/ingest"
-MAX_HTTP_RETRIES = 2
-HTTP_RETRY_DELAY_SEC = 1.0
+from .constants import (
+    AVG_TIME_MS_DECIMALS,
+    DEFAULT_RUNTIME_REPORT_PATH,
+    FILE_REPORT_TRIM_DIVISOR,
+    HTTP_CLIENT_ERROR_MAX_EXCLUSIVE,
+    HTTP_CLIENT_ERROR_MIN,
+    HTTP_REQUEST_TIMEOUT_SEC,
+    HTTP_RETRY_DELAY_SEC,
+    HTTP_SUCCESS_STATUS_MAX_EXCLUSIVE,
+    HTTP_SUCCESS_STATUS_MIN,
+    HTTP_TOO_MANY_REQUESTS,
+    INGEST_ENDPOINT,
+    LOCAL_REPORT_JSON_INDENT,
+    MAX_FILE_REPORTS,
+    MAX_FILE_SIZE_BYTES,
+    MAX_HTTP_RETRIES,
+    MS_PER_SEC,
+)
 
 
 def _build_report(payload: dict) -> dict:
@@ -21,28 +32,35 @@ def _build_report(payload: dict) -> dict:
         "called_functions": {},
         "dead_functions": sorted(payload.get("dead_functions", [])),
     }
+    error_counts = payload.get("error_counts", {})
     for func, stats in payload.get("called_functions", {}).items():
         count = stats.get("count", 0)
         total_time = stats.get("total_time_sec", 0.0)
-        avg_time = round(1000.0 * total_time / count, 2) if count else 0.0
-        error_counts = payload.get("error_counts", {})
-    new_report["called_functions"][func] = {
+        avg_time = round(MS_PER_SEC * total_time / count, AVG_TIME_MS_DECIMALS) if count else 0.0
+        new_report["called_functions"][func] = {
             "count": count,
             "avg_time_ms": avg_time,
             "error_count": error_counts.get(func, 0),
         }
+    feature_flags = payload.get("feature_flags") or []
+    if feature_flags:
+        new_report["feature_flags"] = feature_flags
     return new_report
 
 
 def _build_ingest_payload(report: dict) -> dict:
     """Build backend SnapshotInput payload (project_id, environment, etc.)."""
-    return {
+    payload = {
         "timestamp": report["timestamp"],
         "environment": config.get("environment", "production"),
         "project_id": config.get("project_id", ""),
         "called_functions": report["called_functions"],
         "dead_functions": report["dead_functions"],
     }
+    feature_flags = report.get("feature_flags") or []
+    if feature_flags:
+        payload["feature_flags"] = feature_flags
+    return payload
 
 
 def _send_ingest(payload: dict, report: bool) -> bool:
@@ -68,13 +86,17 @@ def _send_ingest(payload: dict, report: bool) -> bool:
     last_error = None
     for attempt in range(MAX_HTTP_RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                if 200 <= resp.status < 300:
+            with urllib.request.urlopen(req, timeout=HTTP_REQUEST_TIMEOUT_SEC) as resp:
+                if HTTP_SUCCESS_STATUS_MIN <= resp.status < HTTP_SUCCESS_STATUS_MAX_EXCLUSIVE:
                     return True
                 last_error = f"HTTP {resp.status}"
         except urllib.error.HTTPError as e:
             last_error = f"HTTP {e.code}: {e.reason}"
-            if e.code and 400 <= e.code < 500 and e.code != 429:
+            if (
+                e.code
+                and HTTP_CLIENT_ERROR_MIN <= e.code < HTTP_CLIENT_ERROR_MAX_EXCLUSIVE
+                and e.code != HTTP_TOO_MANY_REQUESTS
+            ):
                 break  # no retry on client errors
         except urllib.error.URLError as e:
             last_error = str(e.reason or e)
@@ -84,6 +106,11 @@ def _send_ingest(payload: dict, report: bool) -> bool:
             time.sleep(HTTP_RETRY_DELAY_SEC * (attempt + 1))
 
     return False
+
+
+def _output_path() -> str:
+    configured = (config.get("output_path") or "").strip()
+    return configured or DEFAULT_RUNTIME_REPORT_PATH
 
 
 def flush_data(payload: dict, report: bool = True) -> bool:
@@ -97,27 +124,28 @@ def flush_data(payload: dict, report: bool = True) -> bool:
     http_ok = True
 
     if output in ("file", "both"):
-        os.makedirs(os.path.dirname(DEFAULT_OUTPUT_PATH), exist_ok=True)
-        if os.path.exists(DEFAULT_OUTPUT_PATH):
+        output_path = _output_path()
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        if os.path.exists(output_path):
             try:
-                file_size = os.path.getsize(DEFAULT_OUTPUT_PATH)
+                file_size = os.path.getsize(output_path)
                 if file_size > MAX_FILE_SIZE_BYTES:
                     report_array = []
                 else:
-                    with open(DEFAULT_OUTPUT_PATH, "r") as f:
+                    with open(output_path, "r") as f:
                         report_array = json.load(f)
                         if not isinstance(report_array, list):
                             report_array = []
                     if len(report_array) > MAX_FILE_REPORTS:
-                        report_array = report_array[-MAX_FILE_REPORTS // 2:]
+                        report_array = report_array[-MAX_FILE_REPORTS // FILE_REPORT_TRIM_DIVISOR :]
             except Exception:
                 report_array = []
         else:
             report_array = []
         report_array.append(new_report)
         try:
-            with open(DEFAULT_OUTPUT_PATH, "w") as f:
-                json.dump(report_array, f, indent=2)
+            with open(output_path, "w") as f:
+                json.dump(report_array, f, indent=LOCAL_REPORT_JSON_INDENT)
         except Exception:
             file_ok = False
 

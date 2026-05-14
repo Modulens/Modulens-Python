@@ -1,5 +1,11 @@
 # simple functions for runtime tracking
 
+from modulens import feature_flag
+
+@feature_flag("new_checkout_ui")
+def checkout_config():
+    return True
+
 def greet_user(name):
     do_stuff()
     return f"Hello, {name}!"
