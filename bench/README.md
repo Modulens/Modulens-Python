@@ -41,21 +41,31 @@ python -m bench.run_bench --only baseline_overhead,resolve_code_cache
 
 - **Single runs are noisy.** Each scenario uses `timeit.Timer.autorange()` and
   takes a median of multiple trials, but Windows / virtualized environments can
-  still skew results by 5–10%. The harness flags regressions above **15%**.
-- **`web_handler_io_5ms.overhead_pct` is the number to publish.** It reflects
-  a realistic CRUD endpoint with one fast DB hit. Current measurement on this
-  branch: **~0.66 %**. This is what supports the README "low overhead" claim.
-- **`web_handler_compute.overhead_pct` is the worst-case real-code number** —
-  pure CPU work, no I/O. Current measurement: ~550 %. Any caller running tight
-  pure-Python compute loops should disable Modulens for that path. This is a
-  fundamental limitation of `sys.setprofile`-based profilers, not a bug.
-- **`baseline_overhead.overhead_pct` (fib) is a regression tracker, not a
-  publishable number.** It's the worst case the harness can produce; useful
-  for spotting per-event-cost regressions, not for marketing.
-- **`*.us_added_per_request`** is the additive Python-call cost the profiler
-  imposes per request. For realistic handlers it lands around 80–100 µs. That
-  number is independent of I/O time, which is why I/O-bound endpoints stay
-  under 1 % overhead and CPU-bound endpoints don't.
+  still skew results by 5–10 %. The harness flags regressions above **15 %**.
+- **`ns_per_event` is the fundamental metric.** Across our handlers it sits
+  around **~1,100 ns per profile event** (one `call` event + one `return` event
+  per Python function call, so ~2.2 µs per call). This number stays roughly
+  constant across light and heavy handlers — verified by `ns_per_event` being
+  ~1,097 ns on `web_handler_heavy_compute` (466 events/req) and ~1,116 ns on
+  `web_handler_compute` (76 events/req).
+- **`us_added_per_request` is `events_per_request × ns_per_event`.** It scales
+  linearly with how much Python the request does. There is no "fixed
+  per-request cost"; previous versions of this README claimed otherwise and
+  were wrong.
+- **`web_handler_heavy_io_20ms` is the most defensible "real CRUD endpoint"
+  number** — ~466 events per request, 20 ms total wallclock. Current
+  measurement on this branch: **~2.9 % overhead**. That is what a typical
+  Flask/FastAPI endpoint with ORM serialization will pay.
+- **`web_handler_io_5ms.overhead_pct`** (the *light* synthetic, 76 events,
+  5 ms) currently lands around 1.7 %. This applies to lean handlers and is
+  not representative of a CRUD handler with response shaping.
+- **Compute-bound scenarios** (`*_compute`) measure the worst case where the
+  request does pure Python work with no I/O. Expect 500–700 % overhead. This
+  is a fundamental limitation of `sys.setprofile`-based profilers and only
+  changes with an architecture rewrite (sampling, `sys.monitoring`, or
+  opt-in instrumentation).
+- **`baseline_overhead.overhead_pct` (fib)** is a regression tracker, not a
+  publishable number. It's the worst case the harness can produce.
 - **`resolve_code_cache.miss_over_hit_ratio`** documents the value of the
   per-code-object cache. A high ratio means the cache is doing real work.
 - **`feature_flag_decorator.overhead_ns`** is the only number that matters for
@@ -63,26 +73,38 @@ python -m bench.run_bench --only baseline_overhead,resolve_code_cache
 
 ## Mapping overhead to your workload
 
-The profiler's per-request cost is roughly fixed (~80–100 µs of added Python
-work for a small handler, scaling roughly linearly with the number of Python
-function calls in the request). The percentage overhead therefore depends
-almost entirely on what *else* the request is doing:
+The cost model that actually holds:
 
 ```
-overhead_pct ≈ python_overhead_per_request / total_request_time
-            ≈ 90 µs / total_request_time_in_µs
+overhead_per_request_µs ≈ python_calls_per_request × 2 × 1.1 µs
+                       = python_calls_per_request × 2.2 µs
+
+overhead_pct ≈ overhead_per_request_µs / total_request_time_µs
 ```
 
-| Total request time | Approx overhead |
-|---|---|
-| 100 µs (tight compute loop) | 90 % |
-| 1 ms | ~9 % |
-| 10 ms (typical fast endpoint) | ~0.9 % |
-| 100 ms (slow endpoint / external call) | ~0.09 % |
+To find `python_calls_per_request` for your own handler, run it briefly under
+`cProfile` or `sys.setprofile` and count `call` events. Or use Modulens itself
+for one flush window and read `defined_functions` × actual invocations.
 
-If you need `<1 %` on a sub-millisecond request, the current
-`sys.setprofile`-based architecture cannot deliver it. Options are documented
-in the PR description.
+Realistic mapping (using the measured ~2.2 µs per Python call):
+
+| Calls / req | Profiler adds | At 10 ms wall | At 50 ms wall | At 100 ms wall |
+|---:|---:|---:|---:|---:|
+| 25  (toy)             |   ~55 µs |     0.55 % |     0.11 % |     0.06 % |
+| 75  (lean handler, our `web_handler_*`) |  ~165 µs |    **1.7 %** |     0.33 % |     0.17 % |
+| 250 (typical CRUD w/ ORM)               |  ~550 µs |    **5.5 %** |    **1.1 %** |     0.55 % |
+| 500 (heavy serialization, our `*_heavy`) | ~1.1 ms |     **11 %** |    **2.2 %** |    **1.1 %** |
+| 1000 (very chatty handler)             |   ~2.2 ms |     **22 %** |    **4.4 %** |    **2.2 %** |
+
+The takeaway: **`<1 %` is a property of your specific handler, not the
+profiler.** It holds when `python_calls_per_request × 2.2 µs` is less than
+1 % of your total request time. For a CRUD endpoint with 250 Python calls and
+50 ms wall time, you're already over 1 %. For 100 ms wall time, you're at it.
+For sub-10 ms compute paths, you cannot get there with this architecture.
+
+The honest README claim should be something like: *"Typical overhead is 1–5 %
+on web handlers doing 10–100 ms of work, dominated by per-Python-call cost.
+Disable or use selective instrumentation on tight compute paths."*
 
 ## When to update the baseline
 

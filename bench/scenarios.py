@@ -158,6 +158,82 @@ def _run_handler(*, io_ms: float, item_count: int = 10) -> bytes:
     return _serialize_json({"user": user, "items": items})
 
 
+# -- "heavy" variant: more functions, more items, more layers ------------
+#
+# Designed to approximate a realistic CRUD-with-ORM endpoint:
+# parse → validate → fetch → enrich → permission → build N rich items
+# (each item touches 3 helper functions) → paginate → audit → serialize.
+# Per-request Python call count is roughly an order of magnitude higher than
+# `_run_handler`, which is the realistic shape for a typical Flask/FastAPI
+# handler that does meaningful work (ORM serialization, response shaping).
+
+
+def _format_meta(i: int) -> Dict[str, Any]:
+    return {"index": i, "label": _normalize(f"meta-{i}")}
+
+
+def _build_item_rich(uid: str, i: int) -> Dict[str, Any]:
+    return {
+        "id": i,
+        "user": uid,
+        "tag": _normalize(f"Item-{i}"),
+        "meta": _format_meta(i),
+    }
+
+
+def _build_items_rich(uid: str, n: int) -> List[Dict[str, Any]]:
+    return [_build_item_rich(uid, i) for i in range(n)]
+
+
+def _enrich_user(user: Dict[str, str]) -> Dict[str, str]:
+    return {**user, "display_name": _normalize(user["name"]).title()}
+
+
+def _audit_log(action: str, user_id: str) -> Dict[str, Any]:
+    return {"event": _normalize(action), "user": user_id, "ts": 0}
+
+
+def _compute_pagination(total: int, page_size: int) -> Dict[str, int]:
+    return {"total": total, "pages": (total + page_size - 1) // page_size}
+
+
+def _run_handler_heavy(*, io_ms: float, item_count: int = 50) -> bytes:
+    body = "user_id=42&action=list&n=50"
+    params = _parse_query(body)
+    if not _validate_params(params, ("user_id", "action")):
+        return b"invalid"
+    user = _fetch_user(params["user_id"], io_ms)
+    user = _enrich_user(user)
+    if not _check_perm(user, params["action"]):
+        return b"forbidden"
+    items = _build_items_rich(user["id"], item_count)
+    pagination = _compute_pagination(len(items), 10)
+    audit = _audit_log(params["action"], user["id"])
+    return _serialize_json(
+        {"user": user, "items": items, "pagination": pagination, "audit": audit}
+    )
+
+
+def _count_python_events(fn, *args, **kwargs) -> int:
+    """Count `call`+`return` profile events fired during one invocation of `fn`.
+
+    CPython suppresses profile events while inside the profile callback itself,
+    so the handler's own code does not pollute the count.
+    """
+    counter = [0]
+
+    def handler(frame, event, arg):
+        if event == "call" or event == "return":
+            counter[0] += 1
+
+    sys.setprofile(handler)
+    try:
+        fn(*args, **kwargs)
+    finally:
+        sys.setprofile(None)
+    return counter[0]
+
+
 # -- scenarios -------------------------------------------------------------
 
 
@@ -323,28 +399,37 @@ def bench_flush(*, n_functions: int = 1000) -> Dict[str, float]:
 def _bench_web_handler(
     *,
     label: str,
+    handler,
     io_ms: float,
     trials: int = 5,
     requests_per_trial: int = 100,
 ) -> Dict[str, Any]:
     """Measure profiler overhead on a realistic CRUD-style handler.
 
-    Important: the workload includes a `time.sleep(io_ms)` per request. That
+    Important: the workload may include `time.sleep(io_ms)` per request. The
     sleep is a single C call, so it adds wallclock without adding profile
-    events — the same way real I/O does. The overhead number therefore reflects
-    how much the *Python-level* call cost dominates the request, not how
-    accurately we can profile time inside the sleep.
+    events — same as real I/O. The percentage overhead therefore reflects how
+    much the *Python-level* call cost dominates the request, not how accurately
+    we can profile time inside the sleep.
+
+    `events_per_request` is measured separately by running the handler once
+    under a bare profile hook that just counts call/return events. From that
+    we derive `ns_per_event`, which is the actually-fixed quantity across
+    scenarios. If `ns_per_event` is stable across light vs heavy handlers,
+    the linear-cost model holds.
     """
     _configure_quiet_output(fresh=True)
     prev_interval = cfg_module.config.get("flush_interval")
     cfg_module.config["flush_interval"] = 3600.0
+
+    events_per_request = _count_python_events(handler, io_ms=io_ms)
 
     try:
         base_samples: List[float] = []
         for _ in range(trials):
             t0 = time.perf_counter()
             for _ in range(requests_per_trial):
-                _run_handler(io_ms=io_ms)
+                handler(io_ms=io_ms)
             base_samples.append(time.perf_counter() - t0)
 
         profiler = ModulensProfiler()
@@ -354,7 +439,7 @@ def _bench_web_handler(
             for _ in range(trials):
                 t0 = time.perf_counter()
                 for _ in range(requests_per_trial):
-                    _run_handler(io_ms=io_ms)
+                    handler(io_ms=io_ms)
                 prof_samples.append(time.perf_counter() - t0)
         finally:
             profiler.stop(report=False)
@@ -364,6 +449,12 @@ def _bench_web_handler(
     base = statistics.median(base_samples)
     prof = statistics.median(prof_samples)
     overhead_pct = ((prof - base) / base) * 100 if base > 0 else float("nan")
+    us_added_per_request = ((prof - base) / requests_per_trial) * 1e6
+    ns_per_event = (
+        (us_added_per_request * 1000) / events_per_request
+        if events_per_request > 0
+        else float("nan")
+    )
     return {
         "label": label,
         "baseline_sec": base,
@@ -373,33 +464,58 @@ def _bench_web_handler(
         "io_ms_per_request": io_ms,
         "us_per_request_baseline": (base / requests_per_trial) * 1e6,
         "us_per_request_profiled": (prof / requests_per_trial) * 1e6,
-        "us_added_per_request": ((prof - base) / requests_per_trial) * 1e6,
+        "us_added_per_request": us_added_per_request,
+        "events_per_request": events_per_request,
+        "ns_per_event": ns_per_event,
     }
 
 
 def bench_web_handler_compute() -> Dict[str, Any]:
-    """CPU-bound CRUD-style handler (no simulated I/O). Worst realistic case."""
+    """Light CRUD handler, no simulated I/O. ~25 Python calls / request."""
     return _bench_web_handler(
-        label="CPU-bound CRUD handler (no I/O)",
+        label="Light CRUD handler, no I/O",
+        handler=_run_handler,
         io_ms=0.0,
     )
 
 
 def bench_web_handler_io_5ms() -> Dict[str, Any]:
-    """Typical CRUD endpoint with one fast DB hit."""
+    """Light CRUD endpoint with one fast DB hit."""
     return _bench_web_handler(
-        label="I/O-bound CRUD handler (5ms DB wait)",
+        label="Light CRUD handler, 5ms DB wait",
+        handler=_run_handler,
         io_ms=5.0,
         requests_per_trial=40,
     )
 
 
 def bench_web_handler_io_50ms() -> Dict[str, Any]:
-    """Heavy-I/O endpoint (external API or slow query)."""
+    """Light handler, heavy-I/O endpoint (external API or slow query)."""
     return _bench_web_handler(
-        label="I/O-heavy endpoint (50ms external call)",
+        label="Light handler, 50ms external call",
+        handler=_run_handler,
         io_ms=50.0,
         requests_per_trial=15,
+    )
+
+
+def bench_web_handler_heavy_compute() -> Dict[str, Any]:
+    """Heavy CRUD handler (ORM-style serialization), no I/O. Real worst case."""
+    return _bench_web_handler(
+        label="Heavy CRUD handler (50 rich items), no I/O",
+        handler=_run_handler_heavy,
+        io_ms=0.0,
+        requests_per_trial=40,
+    )
+
+
+def bench_web_handler_heavy_io_20ms() -> Dict[str, Any]:
+    """Heavy CRUD handler with 20ms total I/O — typical real-world endpoint."""
+    return _bench_web_handler(
+        label="Heavy CRUD handler (50 rich items), 20ms DB wait",
+        handler=_run_handler_heavy,
+        io_ms=20.0,
+        requests_per_trial=25,
     )
 
 
@@ -438,6 +554,8 @@ ALL_SCENARIOS = {
     "web_handler_compute": bench_web_handler_compute,
     "web_handler_io_5ms": bench_web_handler_io_5ms,
     "web_handler_io_50ms": bench_web_handler_io_50ms,
+    "web_handler_heavy_compute": bench_web_handler_heavy_compute,
+    "web_handler_heavy_io_20ms": bench_web_handler_heavy_io_20ms,
     "resolve_code_cache": bench_resolve_code_cache,
     "serialize_variant": bench_serialize_variant,
     "feature_flag_decorator": bench_feature_flag_decorator,
