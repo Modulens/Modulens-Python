@@ -6,40 +6,73 @@
   },
   "scenarios": {
     "baseline_overhead": {
-      "baseline_sec": 0.0003363999985595001,
-      "overhead_pct": 2864.892997163831,
-      "profiled_sec": 0.009973899999749847,
+      "baseline_sec": 0.0003366999990248587,
+      "overhead_pct": 3112.1176212251635,
+      "profiled_sec": 0.01081519999934244,
       "workload": "fib(14) x 5"
     },
     "feature_flag_decorator": {
-      "bare_ns": 22.681629999897268,
-      "overhead_ns": 559.3081700009861,
-      "wrapped_ns": 581.9898000008834
+      "bare_ns": 23.03081000009115,
+      "overhead_ns": 573.0007900017881,
+      "wrapped_ns": 596.0316000018793
     },
     "flush_1000": {
-      "flush_sec": 0.006747100000211503,
+      "flush_sec": 0.007868700000472018,
       "n_functions": 1000
     },
     "flush_data_file": {
-      "flush_data_ns": 1496899.9985285336
+      "flush_data_ns": 2277100.0003558584
     },
     "recorder_record": {
-      "record_ns": 475.73320000083186
+      "record_ns": 473.2666000018071
     },
     "resolve_code_cache": {
-      "cache_hit_ns": 113.07999993732665,
-      "cache_miss_ns": 414.440000167815,
-      "miss_over_hit_ratio": 3.665015921449539
+      "cache_hit_ns": 277.32000016840175,
+      "cache_miss_ns": 950.5200003331993,
+      "miss_over_hit_ratio": 3.4275205529929282
     },
     "serialize_variant": {
-      "bool_ns": 76.43753999982437,
-      "dict_ns": 2017.6269999865326,
-      "float_ns": 274.9662000005628,
-      "int_ns": 160.8480499999132,
-      "list_ns": 1871.9904999943537,
-      "long_str_ns": 233.0275000003894,
-      "none_ns": 58.82821999985026,
-      "short_str_ns": 148.94624999942607
+      "bool_ns": 77.9783400001179,
+      "dict_ns": 2216.45499999795,
+      "float_ns": 286.1747999995714,
+      "int_ns": 170.22015000020474,
+      "list_ns": 2075.9109999926295,
+      "long_str_ns": 238.6421999999584,
+      "none_ns": 60.87310000002618,
+      "short_str_ns": 152.86784999989322
+    },
+    "web_handler_compute": {
+      "baseline_sec": 0.0014289000009739539,
+      "io_ms_per_request": 0.0,
+      "label": "CPU-bound CRUD handler (no I/O)",
+      "overhead_pct": 552.8448452590654,
+      "profiled_sec": 0.009328500000265194,
+      "requests_per_trial": 100,
+      "us_added_per_request": 78.9959999929124,
+      "us_per_request_baseline": 14.289000009739539,
+      "us_per_request_profiled": 93.28500000265194
+    },
+    "web_handler_io_50ms": {
+      "baseline_sec": 0.7558977999997296,
+      "io_ms_per_request": 50.0,
+      "label": "I/O-heavy endpoint (50ms external call)",
+      "overhead_pct": 0.6559484628742391,
+      "profiled_sec": 0.760856099999728,
+      "requests_per_trial": 15,
+      "us_added_per_request": 330.5533333332278,
+      "us_per_request_baseline": 50393.18666664864,
+      "us_per_request_profiled": 50723.73999998187
+    },
+    "web_handler_io_5ms": {
+      "baseline_sec": 0.21601249999912397,
+      "io_ms_per_request": 5.0,
+      "label": "I/O-bound CRUD handler (5ms DB wait)",
+      "overhead_pct": 0.6664429153032058,
+      "profiled_sec": 0.21745210000153747,
+      "requests_per_trial": 40,
+      "us_added_per_request": 35.99000006033748,
+      "us_per_request_baseline": 5400.312499978099,
+      "us_per_request_profiled": 5436.302500038437
     }
   }
 }

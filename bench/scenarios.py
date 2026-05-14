@@ -5,6 +5,7 @@ Each scenario returns a `dict` of measurements. Keep the surface narrow so
 """
 from __future__ import annotations
 
+import json
 import os
 import statistics
 import sys
@@ -12,7 +13,7 @@ import tempfile
 import time
 import timeit
 import types
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from modulens import config as cfg_module
 from modulens import feature_flag
@@ -87,6 +88,74 @@ def workload_loop(iterations: int = 500) -> int:
 
 def _workload_inner(x: int) -> int:
     return (x * x) ^ (x >> 1)
+
+
+# -- realistic web-handler workload ----------------------------------------
+#
+# These helpers simulate the per-request call pattern of a small CRUD endpoint:
+# parse query → validate → fetch user (with a sleep standing in for a DB hit)
+# → permission check → build response → serialize. Each helper is a separate
+# Python function so we generate a realistic number of `call`/`return` events
+# per request without inflating the workload with synthetic recursion.
+#
+# Per-request Python-level call count is intentionally modest (~25 plus the
+# per-item normalizations), in the same ballpark as a Flask/FastAPI handler
+# once you exclude the framework's own C-implemented dispatch.
+
+
+def _http_io_ms(ms: float) -> None:
+    """Simulated synchronous I/O wait (DB round trip, external HTTP, etc.)."""
+    if ms > 0:
+        time.sleep(ms / 1000.0)
+
+
+def _normalize(s: str) -> str:
+    return s.strip().lower()
+
+
+def _parse_kv(token: str) -> Tuple[str, str]:
+    k, _, v = token.partition("=")
+    return _normalize(k), _normalize(v)
+
+
+def _parse_query(q: str) -> Dict[str, str]:
+    return dict(_parse_kv(t) for t in q.split("&") if "=" in t)
+
+
+def _validate_params(d: Dict[str, str], required: Tuple[str, ...]) -> bool:
+    return all(k in d for k in required)
+
+
+def _fetch_user(uid: str, io_ms: float) -> Dict[str, str]:
+    _http_io_ms(io_ms)
+    return {"id": uid, "role": "user", "name": "alice"}
+
+
+def _check_perm(user: Dict[str, str], action: str) -> bool:
+    return action in {"read", "list", "create"} and user["role"] != "banned"
+
+
+def _build_items(uid: str, n: int) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for i in range(n):
+        items.append({"id": i, "user": uid, "tag": _normalize(f"Item-{i}")})
+    return items
+
+
+def _serialize_json(obj: Any) -> bytes:
+    return json.dumps(obj, sort_keys=True).encode()
+
+
+def _run_handler(*, io_ms: float, item_count: int = 10) -> bytes:
+    body = "user_id=42&action=list&n=10"
+    params = _parse_query(body)
+    if not _validate_params(params, ("user_id", "action")):
+        return b"invalid"
+    user = _fetch_user(params["user_id"], io_ms)
+    if not _check_perm(user, params["action"]):
+        return b"forbidden"
+    items = _build_items(user["id"], item_count)
+    return _serialize_json({"user": user, "items": items})
 
 
 # -- scenarios -------------------------------------------------------------
@@ -251,6 +320,89 @@ def bench_flush(*, n_functions: int = 1000) -> Dict[str, float]:
     return {"n_functions": n_functions, "flush_sec": elapsed}
 
 
+def _bench_web_handler(
+    *,
+    label: str,
+    io_ms: float,
+    trials: int = 5,
+    requests_per_trial: int = 100,
+) -> Dict[str, Any]:
+    """Measure profiler overhead on a realistic CRUD-style handler.
+
+    Important: the workload includes a `time.sleep(io_ms)` per request. That
+    sleep is a single C call, so it adds wallclock without adding profile
+    events — the same way real I/O does. The overhead number therefore reflects
+    how much the *Python-level* call cost dominates the request, not how
+    accurately we can profile time inside the sleep.
+    """
+    _configure_quiet_output(fresh=True)
+    prev_interval = cfg_module.config.get("flush_interval")
+    cfg_module.config["flush_interval"] = 3600.0
+
+    try:
+        base_samples: List[float] = []
+        for _ in range(trials):
+            t0 = time.perf_counter()
+            for _ in range(requests_per_trial):
+                _run_handler(io_ms=io_ms)
+            base_samples.append(time.perf_counter() - t0)
+
+        profiler = ModulensProfiler()
+        try:
+            profiler.start(include=["bench"])
+            prof_samples: List[float] = []
+            for _ in range(trials):
+                t0 = time.perf_counter()
+                for _ in range(requests_per_trial):
+                    _run_handler(io_ms=io_ms)
+                prof_samples.append(time.perf_counter() - t0)
+        finally:
+            profiler.stop(report=False)
+    finally:
+        cfg_module.config["flush_interval"] = prev_interval
+
+    base = statistics.median(base_samples)
+    prof = statistics.median(prof_samples)
+    overhead_pct = ((prof - base) / base) * 100 if base > 0 else float("nan")
+    return {
+        "label": label,
+        "baseline_sec": base,
+        "profiled_sec": prof,
+        "overhead_pct": overhead_pct,
+        "requests_per_trial": requests_per_trial,
+        "io_ms_per_request": io_ms,
+        "us_per_request_baseline": (base / requests_per_trial) * 1e6,
+        "us_per_request_profiled": (prof / requests_per_trial) * 1e6,
+        "us_added_per_request": ((prof - base) / requests_per_trial) * 1e6,
+    }
+
+
+def bench_web_handler_compute() -> Dict[str, Any]:
+    """CPU-bound CRUD-style handler (no simulated I/O). Worst realistic case."""
+    return _bench_web_handler(
+        label="CPU-bound CRUD handler (no I/O)",
+        io_ms=0.0,
+    )
+
+
+def bench_web_handler_io_5ms() -> Dict[str, Any]:
+    """Typical CRUD endpoint with one fast DB hit."""
+    return _bench_web_handler(
+        label="I/O-bound CRUD handler (5ms DB wait)",
+        io_ms=5.0,
+        requests_per_trial=40,
+    )
+
+
+def bench_web_handler_io_50ms() -> Dict[str, Any]:
+    """Heavy-I/O endpoint (external API or slow query)."""
+    return _bench_web_handler(
+        label="I/O-heavy endpoint (50ms external call)",
+        io_ms=50.0,
+        requests_per_trial=15,
+    )
+
+
 def bench_flush_data_file_only(*, trials: int = 5) -> Dict[str, float]:
     """End-to-end `flush_data` cost with file sink only (no HTTP).
 
@@ -283,6 +435,9 @@ def bench_flush_data_file_only(*, trials: int = 5) -> Dict[str, float]:
 
 ALL_SCENARIOS = {
     "baseline_overhead": bench_baseline_overhead,
+    "web_handler_compute": bench_web_handler_compute,
+    "web_handler_io_5ms": bench_web_handler_io_5ms,
+    "web_handler_io_50ms": bench_web_handler_io_50ms,
     "resolve_code_cache": bench_resolve_code_cache,
     "serialize_variant": bench_serialize_variant,
     "feature_flag_decorator": bench_feature_flag_decorator,
