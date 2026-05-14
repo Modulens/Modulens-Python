@@ -1,0 +1,45 @@
+{
+  "env": {
+    "implementation": "CPython",
+    "platform": "Windows-11-10.0.22631-SP0",
+    "python_version": "3.12.3"
+  },
+  "scenarios": {
+    "baseline_overhead": {
+      "baseline_sec": 0.0003363999985595001,
+      "overhead_pct": 2864.892997163831,
+      "profiled_sec": 0.009973899999749847,
+      "workload": "fib(14) x 5"
+    },
+    "feature_flag_decorator": {
+      "bare_ns": 22.681629999897268,
+      "overhead_ns": 559.3081700009861,
+      "wrapped_ns": 581.9898000008834
+    },
+    "flush_1000": {
+      "flush_sec": 0.006747100000211503,
+      "n_functions": 1000
+    },
+    "flush_data_file": {
+      "flush_data_ns": 1496899.9985285336
+    },
+    "recorder_record": {
+      "record_ns": 475.73320000083186
+    },
+    "resolve_code_cache": {
+      "cache_hit_ns": 113.07999993732665,
+      "cache_miss_ns": 414.440000167815,
+      "miss_over_hit_ratio": 3.665015921449539
+    },
+    "serialize_variant": {
+      "bool_ns": 76.43753999982437,
+      "dict_ns": 2017.6269999865326,
+      "float_ns": 274.9662000005628,
+      "int_ns": 160.8480499999132,
+      "list_ns": 1871.9904999943537,
+      "long_str_ns": 233.0275000003894,
+      "none_ns": 58.82821999985026,
+      "short_str_ns": 148.94624999942607
+    }
+  }
+}
