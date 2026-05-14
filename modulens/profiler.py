@@ -195,6 +195,25 @@ class ModulensProfiler:
         sys.setprofile(None)
         threading.setprofile(None)
 
+    def _suspend_profile_hook(self) -> bool:
+        """Detach the profile hook for the current thread.
+
+        Returns True if the hook was previously installed. Used by `flush()` so
+        the heavy bookkeeping inside the flush itself (inspect, json, file I/O)
+        does not re-enter `_profile_handler` and pay quadratic overhead.
+        """
+        if not self._initialized:
+            return False
+        sys.setprofile(None)
+        threading.setprofile(None)
+        return True
+
+    def _restore_profile_hook(self) -> None:
+        if not self._initialized:
+            return
+        sys.setprofile(self._profile_handler)
+        threading.setprofile(self._profile_handler)
+
     def _shutdown(self) -> None:
         """Atexit handler: stop flush loop and do final flush."""
         self._stop_event.set()
@@ -256,35 +275,44 @@ class ModulensProfiler:
             self.start_time = time.time()
 
     def flush(self, report: bool = True) -> None:
-        with self._lock:
-            duration = time.time() - self.start_time
-            counts_snapshot = dict(self.call_counts)
-            durations_snapshot = dict(self.call_durations)
-            errors_snapshot = dict(self.error_counts)
+        # Detach the profile hook from this thread for the duration of the
+        # flush. Without this, every nested call inside `inspect.getmembers`,
+        # `json.dump`, and the file/HTTP sinks re-enters `_profile_handler`,
+        # inflating flush latency well beyond the workload it is reporting on.
+        hook_was_installed = self._suspend_profile_hook()
+        try:
+            with self._lock:
+                duration = time.time() - self.start_time
+                counts_snapshot = dict(self.call_counts)
+                durations_snapshot = dict(self.call_durations)
+                errors_snapshot = dict(self.error_counts)
 
-        used = set(counts_snapshot.keys())
-        all_funcs = self._get_defined_functions()
-        unused = sorted(all_funcs - used)
+            used = set(counts_snapshot.keys())
+            all_funcs = self._get_defined_functions()
+            unused = sorted(all_funcs - used)
 
-        out: Dict[str, Any] = {
-            "duration_sec": round(duration, DURATION_SEC_DECIMALS),
-            "called_functions": {},
-            "dead_functions": unused,
-            "defined_functions": sorted(all_funcs),
-            "error_counts": errors_snapshot,
-            "feature_flags": default_recorder.snapshot(),
-        }
-        for key, cnt in counts_snapshot.items():
-            tot = durations_snapshot.get(key, 0.0)
-            avg_ms = (tot / cnt * MS_PER_SEC) if cnt else 0.0
-            out["called_functions"][key] = {
-                "count": cnt,
-                "total_time_sec": round(tot, TOTAL_TIME_SEC_DECIMALS),
-                "avg_time_ms": round(avg_ms, AVG_TIME_MS_DECIMALS),
+            out: Dict[str, Any] = {
+                "duration_sec": round(duration, DURATION_SEC_DECIMALS),
+                "called_functions": {},
+                "dead_functions": unused,
+                "defined_functions": sorted(all_funcs),
+                "error_counts": errors_snapshot,
+                "feature_flags": default_recorder.snapshot(),
             }
-        ok = flush_data(out, report=report)
-        if ok:
-            self._reset_after_flush()
+            for key, cnt in counts_snapshot.items():
+                tot = durations_snapshot.get(key, 0.0)
+                avg_ms = (tot / cnt * MS_PER_SEC) if cnt else 0.0
+                out["called_functions"][key] = {
+                    "count": cnt,
+                    "total_time_sec": round(tot, TOTAL_TIME_SEC_DECIMALS),
+                    "avg_time_ms": round(avg_ms, AVG_TIME_MS_DECIMALS),
+                }
+            ok = flush_data(out, report=report)
+            if ok:
+                self._reset_after_flush()
+        finally:
+            if hook_was_installed:
+                self._restore_profile_hook()
 
     def start(
         self,

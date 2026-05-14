@@ -164,5 +164,49 @@ class ProfileHandlerErrorTests(unittest.TestCase):
         self.assertGreaterEqual(warner.call_count, 1)
 
 
+class FlushSuspendsProfileHookTests(unittest.TestCase):
+    """Regression guard for the silent quadratic overhead bug.
+
+    Prior to the fix, `flush()` ran with `sys.setprofile` still attached, so
+    every nested call inside `inspect.getmembers` / `json.dump` / file I/O
+    re-entered `_profile_handler`. The fix is to suspend the hook for the
+    duration of `flush()` and restore it after.
+    """
+
+    def test_profile_hook_is_none_during_flush_body(self):
+        profiler = ModulensProfiler()
+        profiler._initialized = True  # simulate post-start() state
+        seen_hooks = []
+
+        def spy_get_defined_functions():
+            seen_hooks.append(sys.getprofile())
+            return set()
+
+        profiler._get_defined_functions = spy_get_defined_functions  # type: ignore[assignment]
+        # Pretend the hook was installed by start().
+        sys.setprofile(profiler._profile_handler)
+        try:
+            with mock.patch("modulens.profiler.flush_data", return_value=True):
+                profiler.flush(report=False)
+            self.assertEqual(seen_hooks, [None])
+            # Hook restored after flush. Bound-method identity isn't preserved
+            # across attribute access, so compare via the underlying function.
+            restored = sys.getprofile()
+            self.assertIsNotNone(restored)
+            self.assertIs(restored.__func__, profiler._profile_handler.__func__)
+            self.assertIs(restored.__self__, profiler)
+        finally:
+            sys.setprofile(None)
+            profiler._initialized = False
+
+    def test_hook_not_restored_when_profiler_not_initialized(self):
+        profiler = ModulensProfiler()
+        self.assertFalse(profiler._initialized)
+        with mock.patch("modulens.profiler.flush_data", return_value=True):
+            profiler.flush(report=False)
+        # Never installed, so we never restore it.
+        self.assertIsNone(sys.getprofile())
+
+
 if __name__ == "__main__":
     unittest.main()
