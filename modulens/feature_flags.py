@@ -133,8 +133,7 @@ def feature_flag(name: Optional[str] = None) -> Callable[..., Any]:
     Exceptions are not counted. The logical flag name defaults to the function name.
     """
 
-    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
-        flag_name = name if name is not None else fn.__name__
+    def _make_wrapper(fn: Callable[..., Any], flag_name: str) -> Callable[..., Any]:
         function_name = f"{fn.__module__}.{fn.__qualname__}"
         record = default_recorder.record
 
@@ -158,5 +157,10 @@ def feature_flag(name: Optional[str] = None) -> Callable[..., Any]:
 
     if callable(name):
         fn = name
-        return decorate(fn)
+        return _make_wrapper(fn, fn.__name__)
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        flag_name = name if name is not None else fn.__name__
+        return _make_wrapper(fn, flag_name)
+
     return decorate
