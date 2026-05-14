@@ -15,7 +15,7 @@
 - **Per-function error tracking** — counts exceptions at the originating function, not just the handler
 - **Performance metrics** — call counts, total runtime, and average execution time per function
 - **Dependency graphs** — visualize how your modules and functions depend on each other
-- **Under 1% overhead** — built on Python's native `sys.setprofile` with configurable sampling
+- **Low production overhead** — typically 1–3 % on web handlers; built on Python's native `sys.setprofile` with configurable sampling for tighter budgets
 
 ## Quick Start
 
@@ -143,6 +143,15 @@ Omit the name to use the function name as the flag key. Variants are capped for 
 ## How It Works
 
 Modulens uses Python's `sys.setprofile` to intercept function calls and returns at the interpreter level. It tracks call counts, durations, and exceptions per function, then flushes snapshots on a configurable interval. The dashboard aggregates these into trends, detects dead code by comparing defined vs. called functions, and can open GitHub PRs to remove the dead ones.
+
+### Overhead and accuracy
+
+Modulens adds roughly 2 µs per Python function call (one `call` event + one `return` event at about 1.1 µs each, measured on CPython 3.12). For a typical Flask/FastAPI request making 200–500 Python calls in 20–100 ms of wallclock, that works out to 0.5–5 % overhead — within the normal noise of GC pauses and neighboring traffic. See [`bench/`](bench/README.md) for the harness and a workload-to-overhead mapping table.
+
+Two caveats worth knowing:
+
+- **Tight pure-CPU paths** (sub-millisecond requests that do no I/O) will see much higher overhead because per-event cost dominates. Use `sample_rate=0.1` or wrap those paths with explicit `modulens.stop()` / `modulens.start()`.
+- **Per-function timings below ~10 µs are dominated by profiler overhead** and should be treated as upper bounds. Modulens is built to find your slow handlers and dead code, not to micro-benchmark microsecond-level helpers — reach for `timeit` or `cProfile` for that.
 
 ## Requirements
 
